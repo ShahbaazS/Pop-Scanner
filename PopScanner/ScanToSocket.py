@@ -1415,6 +1415,10 @@ class ScanToSocketLogic(ScriptedLoadableModuleLogic):
         # 1. Marching Cylinder Centerline & Radius Algorithm
         # March proximally (from tip back into the arm shaft toward shoulder) to sample clean cylinder slices
         if patientModelNode and patientModelNode.GetPolyData() and all_pts is not None:
+            obbTree = vtk.vtkOBBTree()
+            obbTree.SetDataSet(patientModelNode.GetPolyData())
+            obbTree.BuildLocator()
+            
             curr_center = np.copy(p_tip)
             curr_dir = -np.copy(direction_vector) # March proximally into arm shaft
             
@@ -1427,50 +1431,44 @@ class ScanToSocketLogic(ScriptedLoadableModuleLogic):
             for step in range(1, max_steps + 1):
                 pred_center = p_tip + (step * step_size) * curr_dir
                 
-                # Construct local orthogonal vectors for sector angle binning
+                # Construct local orthogonal vectors for radial raycasting
                 ref = np.array([0.0, 1.0, 0.0])
                 if abs(np.dot(ref, curr_dir)) > 0.9:
                     ref = np.array([1.0, 0.0, 0.0])
                 u = np.cross(curr_dir, ref); u /= np.linalg.norm(u)
                 w = np.cross(curr_dir, u)
                 
-                # Collect vertices within +-5.0mm slice thickness from predicted step plane
-                v_vecs = all_pts - pred_center
-                z_dists = np.dot(v_vecs, curr_dir)
-                slice_mask = np.abs(z_dists) <= 5.0
-                slice_pts = all_pts[slice_mask]
-                
-                if len(slice_pts) < 20:
-                    break # End of stump reached!
+                # Raycast radially outward in 36 directions
+                hull_pts = []
+                for i in range(36):
+                    ang = i * 2.0 * math.pi / 36.0
+                    ray_dir = math.cos(ang) * u + math.sin(ang) * w
                     
-                # Calculate orthogonal radial distances from current step axis
-                r_vecs = slice_pts - pred_center - np.outer(np.dot(slice_pts - pred_center, curr_dir), curr_dir)
-                r_dists = np.linalg.norm(r_vecs, axis=1)
-                
-                # Check if we hit torso/shoulder (if more than 30% of slice points have radius > 65mm)
-                if np.mean(r_dists > 65.0) > 0.30:
-                    continue # Skip torso attachment slices
+                    pSource = pred_center
+                    pTarget = pred_center + ray_dir * 100.0
                     
-                # Filter to realistic anatomical arm radius range (15mm to 65mm)
-                valid_mask = (r_dists >= 15.0) & (r_dists <= 65.0)
-                valid_pts = slice_pts[valid_mask]
-                valid_r = r_dists[valid_mask]
-                valid_r_vecs = r_vecs[valid_mask]
-                
-                if len(valid_pts) < 15:
-                    continue
+                    points = vtk.vtkPoints()
+                    cellIds = vtk.vtkIdList()
+                    obbTree.IntersectWithLine(pSource, pTarget, points, cellIds)
                     
-                # 36-sector outer skin boundary filter (ignores inner hollow walls/padding)
-                sector_max_r = [-1.0] * 36
-                sector_pts = [None] * 36
-                for i_pt in range(len(valid_pts)):
-                    ang = math.atan2(np.dot(valid_r_vecs[i_pt], w), np.dot(valid_r_vecs[i_pt], u))
-                    b_idx = int((ang + math.pi) / (2.0 * math.pi) * 36.0) % 36
-                    if valid_r[i_pt] > sector_max_r[b_idx]:
-                        sector_max_r[b_idx] = valid_r[i_pt]
-                        sector_pts[b_idx] = valid_pts[i_pt]
-                        
-                hull_pts = [pt for pt in sector_pts if pt is not None]
+                    # vtkOBBTree intersections are NOT guaranteed to be sorted by distance!
+                    # We must evaluate all intersections and explicitly pick the outermost one
+                    # that falls within realistic anatomical bounds (15-65mm).
+                    valid_pts_for_ray = []
+                    for j in range(points.GetNumberOfPoints()):
+                        pt = [0.0, 0.0, 0.0]
+                        points.GetPoint(j, pt)
+                        r = np.linalg.norm(np.array(pt) - pred_center)
+                        if 15.0 <= r <= 65.0:
+                            valid_pts_for_ray.append((r, pt))
+                            
+                    if valid_pts_for_ray:
+                        # Sort by radius descending (largest first)
+                        valid_pts_for_ray.sort(key=lambda x: x[0], reverse=True)
+                        hull_pts.append(np.array(valid_pts_for_ray[0][1]))
+                if len(hull_pts) < 12:
+                    break # End of stump reached or hit torso
+                    
                 if len(hull_pts) >= 12:
                     step_centroid = np.mean(hull_pts, axis=0)
                     # Radius is median distance of outer skin points from refined slice centroid
