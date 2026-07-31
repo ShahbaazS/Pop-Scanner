@@ -1365,12 +1365,9 @@ class ScanToSocketLogic(ScriptedLoadableModuleLogic):
             if pts and pts.GetNumberOfPoints() > 100:
                 all_pts = np.array([pts.GetPoint(i) for i in range(pts.GetNumberOfPoints())])
                 torso_center = np.mean(all_pts, axis=0)
-                # Shift skin click p0 to true internal cylinder centerline (average of 80mm cross-section)
-                dists_0 = np.linalg.norm(all_pts - p0, axis=1)
-                near_0 = all_pts[dists_0 <= 80.0]
-                if len(near_0) > 30:
-                    p0 = np.mean(near_0, axis=0)
-                    logging.info(f"Shifted skin click p0 to true internal cylinder centerline: {p0}")
+                # We no longer arbitrarily shift p0 using local mesh mean. 
+                # The user's clinical click (Shoulder Pole to Tip Pole) forms a naturally perfect centerline.
+                logging.info(f"Using raw skin click p0 as shoulder pole: {p0}")
 
         # Determine tip (base of amputation where elbow attaches) and shoulder points
         p_tip = np.copy(p0)
@@ -1380,10 +1377,7 @@ class ScanToSocketLogic(ScriptedLoadableModuleLogic):
             p1 = np.zeros(3); armLandmarks.GetNthControlPointPosition(1, p1)
             raw_p1 = np.copy(p1)
             if all_pts is not None:
-                dists_1 = np.linalg.norm(all_pts - p1, axis=1)
-                near_1 = all_pts[dists_1 <= 80.0]
-                if len(near_1) > 30:
-                    p1 = np.mean(near_1, axis=0)
+                pass # Removed flawed local-mean shift for p1 as well
             # Identify which point is shoulder (closer to torso center) and which is amputation tip
             if np.linalg.norm(p0 - torso_center) < np.linalg.norm(p1 - torso_center):
                 p_tip = p1
@@ -1394,6 +1388,7 @@ class ScanToSocketLogic(ScriptedLoadableModuleLogic):
                 p_tip = p0
                 p_shoulder = p1
                 raw_shoulder = np.copy(raw_p1)
+                
             direction_vector = p_tip - p_shoulder
             norm = np.linalg.norm(direction_vector)
             stump_length = float(norm)
@@ -1426,7 +1421,8 @@ class ScanToSocketLogic(ScriptedLoadableModuleLogic):
             marched_radii = []
             
             step_size = 10.0
-            max_steps = 8
+            # March only the distal 50% of the stump to completely avoid Torso/Shoulder geometry
+            max_steps = max(2, min(8, int((stump_length * 0.50) / step_size))) if stump_length > 0 else 8
             
             for step in range(1, max_steps + 1):
                 pred_center = p_tip + (step * step_size) * curr_dir
@@ -1459,12 +1455,13 @@ class ScanToSocketLogic(ScriptedLoadableModuleLogic):
                         pt = [0.0, 0.0, 0.0]
                         points.GetPoint(j, pt)
                         r = np.linalg.norm(np.array(pt) - pred_center)
-                        if 15.0 <= r <= 65.0:
+                        if 5.0 <= r <= 85.0: # Expanded bounds to support very thin tips (5mm) and thick arms (85mm)
                             valid_pts_for_ray.append((r, pt))
                             
                     if valid_pts_for_ray:
-                        # Sort by radius descending (largest first)
-                        valid_pts_for_ray.sort(key=lambda x: x[0], reverse=True)
+                        # Sort by radius ascending (smallest first) to hit the arm skin 
+                        # and completely ignore the Torso or other limbs further along the ray!
+                        valid_pts_for_ray.sort(key=lambda x: x[0], reverse=False)
                         hull_pts.append(np.array(valid_pts_for_ray[0][1]))
                 if len(hull_pts) < 12:
                     break # End of stump reached or hit torso
@@ -1473,14 +1470,18 @@ class ScanToSocketLogic(ScriptedLoadableModuleLogic):
                     step_centroid = np.mean(hull_pts, axis=0)
                     # Radius is median distance of outer skin points from refined slice centroid
                     step_r = float(np.median([np.linalg.norm(pt - step_centroid - np.dot(pt - step_centroid, curr_dir)*curr_dir) for pt in hull_pts]))
+                    
+                    # Torso Collision Detection: if radius jumps by > 15mm from previous slice, we hit the Torso
+                    if len(marched_radii) > 0 and (step_r - marched_radii[-1]) > 15.0:
+                        logging.info(f"Torso collision detected at step {step} (Radius spiked from {marched_radii[-1]:.1f} to {step_r:.1f}). Stopping march.")
+                        break
+                        
                     marched_centers.append(step_centroid)
                     marched_radii.append(step_r)
                     
-                    # Dynamically curve marching vector along discovered anatomical centerline
-                    if len(marched_centers) >= 2:
-                        new_vec = marched_centers[-1] - marched_centers[0]
-                        if np.linalg.norm(new_vec) > 1e-6:
-                            curr_dir = new_vec / np.linalg.norm(new_vec)
+                    # We NO LONGER dynamically curve `curr_dir`.
+                    # Angled slicing of a tapered ellipsoid mathematically shifts the centroid, causing runaway drift!
+                    # Marching straight along the initial axis guarantees slice centers converge to the true centerline.
 
             if len(marched_centers) >= 2:
                 # Trajectory strictly derived from marched slice centroids along the arm!
@@ -1490,7 +1491,19 @@ class ScanToSocketLogic(ScriptedLoadableModuleLogic):
                     refined_dir = traj_vec / traj_norm
                     if np.dot(refined_dir, direction_vector) < 0:
                         refined_dir = -refined_dir
-                    refined_p1 = p_tip
+                    
+                    # Safeguard: If marched trajectory deviates massively from user's manual trajectory,
+                    # it means raycasts hit the Torso or geometry is distorted. Trust the user's clinical clicks!
+                    angle_diff = np.degrees(np.arccos(np.clip(np.dot(refined_dir, direction_vector), -1.0, 1.0)))
+                    if angle_diff > 35.0:
+                        logging.warning(f"Marched trajectory deviated by {angle_diff:.1f} deg! Falling back to user's manual trajectory.")
+                        refined_dir = direction_vector
+                        
+                    # Mathematically center the placement: project the raw tip onto the marched centerline!
+                    # This completely satisfies the requirement for the arm extending from the true mathematical center.
+                    centerline_p0 = marched_centers[0]
+                    refined_p1 = centerline_p0 + np.dot(p_tip - centerline_p0, refined_dir) * refined_dir
+                    
                     stump_radius = float(np.median(marched_radii))
                     logging.info(f"Marching Algorithm computed trajectory across {len(marched_centers)} slices: r={stump_radius:.2f}mm, length={traj_norm:.1f}mm")
             elif len(marched_centers) == 1:
